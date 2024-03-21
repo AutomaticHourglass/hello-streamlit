@@ -30,10 +30,15 @@ def show_code(demo):
 
 # Function to handle rectangle selection
 def select_rectangle(x1, y1, x2, y2):
-    rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=1, edgecolor='r', facecolor='none')
+    rect = plt.Rectangle(
+        (x1, y1), x2 - x1, y2 - y1, linewidth=1, edgecolor="r", facecolor="none"
+    )
     ax.add_patch(rect)
-    selected_points = [(xi, yi) for xi, yi in zip(x, y) if x1 <= xi <= x2 and y1 <= yi <= y2]
+    selected_points = [
+        (xi, yi) for xi, yi in zip(x, y) if x1 <= xi <= x2 and y1 <= yi <= y2
+    ]
     return selected_points
+
 
 def double_slider():
     # HTML and JavaScript code for custom double slider
@@ -59,10 +64,13 @@ def double_slider():
 
     # Streamlit sidebar widget for displaying and selecting range
     st.sidebar.markdown("# Select Range")
-    st.sidebar.write("Selected Range: ", st.slider("", 0, 100, (20, 80), key="double_slider"))
+    st.sidebar.write(
+        "Selected Range: ", st.slider("", 0, 100, (20, 80), key="double_slider")
+    )
 
     # Inject JavaScript code into the Streamlit app
     st.markdown(double_slider_script, unsafe_allow_html=True)
+
 
 def mouse_selection():
     # JavaScript code for mouse selection and freezing plot on Shift keydown

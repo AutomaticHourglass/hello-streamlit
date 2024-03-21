@@ -12,20 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gzip
+import pickle
 from urllib.error import URLError
 
 import altair as alt
 import pandas as pd
-
 import streamlit as st
-from streamlit.hello.utils import show_code
 from google.cloud import bigquery
-import pandas as pd
-import pickle
-import gzip
+from streamlit.hello.utils import show_code
+
 
 def query_stackoverflow():
-    client = bigquery.Client.from_service_account_json('secrets/service_account.json')
+    client = bigquery.Client.from_service_account_json("secrets/service_account.json")
     query_job = client.query(
         """
         SELECT
@@ -42,7 +41,7 @@ def query_stackoverflow():
     results = query_job.result()  # Waits for job to complete.
 
     for row in results:
-        print("{} : {} views".format(row.url, row.view_count))
+        print(f"{row.url} : {row.view_count} views")
 
 
 def data_frame_demo():
