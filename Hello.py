@@ -16,20 +16,36 @@ import json
 import math
 import pickle
 import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
+import folium
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from bokeh.io import curdoc
+from bokeh.layouts import gridplot
+from bokeh.models import BoxSelectTool, CustomJS
+from bokeh.plotting import figure, show
+from plotly.graph_objs import scatter
 from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from streamlit.logger import get_logger
+from streamlit_folium import st_folium
+from streamlit_plotly_events import plotly_events
+from streamlit_plotly_mapbox_events import plotly_mapbox_events
 from torch.utils.data import DataLoader, TensorDataset
+
+# The plot server must be running
+# Go to http://localhost:5006/bokeh to view this plot
+
 
 LOGGER = get_logger(__name__)
 
@@ -114,7 +130,7 @@ def encode_cols(df):
         dc = df[c]
         fc = get_most_values(dc)
         idx = ~dc.isin(fc)
-        df[c][idx] = "other"
+        df.loc[idx, c] = "other"
     return df
 
 
@@ -135,7 +151,7 @@ def convert_to_pytorch(df, device="cpu"):
     return torch.from_numpy(pd.get_dummies(df.astype(str)).values).float().to(device)
 
 
-def calculate_likelihood(df, idx, eps=3e-2):
+def calculate_likelihood(df, idx, eps=3e-2, min_occurrence=10):
     res = {}
     ratio = idx.mean()
     for c in df.columns:
@@ -147,19 +163,22 @@ def calculate_likelihood(df, idx, eps=3e-2):
         cur_entropy = entropy(dc)
         for v in vc.index:
             cur_idx = dc == v
+            if cur_idx.sum() < min_occurrence:
+                continue
+
             cur_ratio = idx[cur_idx].mean()
 
             if (
                 np.isnan(cur_ratio)
                 or cur_ratio < eps
                 or cur_ratio > 1 - eps
-                or cur_entropy < 1.1
-                or cur_entropy > 3
+                # or cur_entropy < 1.1
+                # or cur_entropy > 3
             ):
                 continue
             likelihood = cur_ratio / ratio
 
-            st.write(cur_ratio, cur_entropy, c, v)
+            # st.write(cur_ratio, cur_entropy, c, v)
             res[f"{c}-{v}"] = (likelihood - 1) * 100
     res = dict(sorted(res.items(), key=lambda x: x[1], reverse=True))
     return res
@@ -276,19 +295,157 @@ def train_model(
     return model
 
 
-# Main function
-def main():
-    st.set_page_config(
-        page_title="Hello",
-        page_icon="👋",
+def selection_fn(trace, points, selector):
+    idx = points.point_inds
+    return idx
+
+
+@dataclass
+class Point:
+    lat: float
+    lon: float
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "Point":
+        if "lat" in data:
+            return cls(float(data["lat"]), float(data["lng"]))
+        elif "latitude" in data:
+            return cls(float(data["latitude"]), float(data["longitude"]))
+        else:
+            raise NotImplementedError(data.keys())
+
+    def is_close_to(self, other: "Point") -> bool:
+        close_lat = self.lat - 0.0001 <= other.lat <= self.lat + 0.0001
+        close_lon = self.lon - 0.0001 <= other.lon <= self.lon + 0.0001
+        return close_lat and close_lon
+
+
+@dataclass
+class Bounds:
+    south_west: Point
+    north_east: Point
+
+    def contains_point(self, point: Point) -> bool:
+        in_lon = self.south_west.lon <= point.lon <= self.north_east.lon
+        in_lat = self.south_west.lat <= point.lat <= self.north_east.lat
+
+        return in_lon and in_lat
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "Bounds":
+        return cls(
+            Point.from_dict(data["_southWest"]), Point.from_dict(data["_northEast"])
+        )
+
+
+# @selection_fn
+def plot_2d_scatter(df, label):
+    # Assuming encoded_data contains the encoded data (torch tensor)
+    # encoded_data should have shape (num_samples, 3)
+    n_class = len(np.unique(label))
+    n_components = st.slider(
+        "Number of components", 2, n_class - 1, min(n_class - 1, 4)
     )
+    lda = LinearDiscriminantAnalysis(n_components=n_components)
 
-    st.write("# Welcome to Streamlit! 👋")
+    # Plot the 3D scatter plot
+    fig = plt.figure()
+    # ax = fig.add_subplot(111, projection='3d')
+    ind = np.random.choice(len(df), size=1000, replace=True)
 
-    # Get data
-    df = get_data()
-    device = "mps"
+    coords = pd.get_dummies(df.iloc[ind])
+    pts = lda.fit_transform(coords, label[ind])
+    pts = pd.DataFrame(pts, columns=[f"dim{i}" for i in range(n_components)])
 
+    fig = px.scatter_matrix(pts, dimensions=pts.columns, color=label[ind])
+    st.plotly_chart(fig, height=400)
+
+    # mapbox.update_layout(mapbox_style="carto-positron")
+    # mapbox.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0})
+
+    # mapbox_events = plotly_mapbox_events(
+    #     mapbox,
+    #     click_event=False,
+    #     select_event=True,
+    #     hover_event=False,
+    # )
+
+    # return fig,
+
+    # fig = px.scatter(
+    #     x=pts[:, 0],
+    #     y=pts[:, 1],
+    #     color=label[ind],)
+    # st.plotly_chart(fig)
+    #
+    # # select_event
+    # # selected_points = plotly_events(fig, click_event=True, hover_event=False, select_event=True)
+    #
+    return fig, pts, label[ind]
+    # return fig, selected_points
+
+
+def bokeh_demo(data, label):
+    # Writes a component similar to st.write()
+    # fig = px.scatter(x=data["dim0"], y=data['dim1'])
+    # st.plotly_chart(fig, height=400)
+    #
+    # # selected_points = plotly_events(fig, click_event=False, hover_event=False, select_event=True)
+    # selected_points = fig.data[0].selectedpoints
+    # print(selected_points)
+
+    # create three normal population samples with different parameters
+    x1 = np.random.normal(loc=5.0, size=400) * 100
+    y1 = np.random.normal(loc=10.0, size=400) * 10
+
+    x2 = np.random.normal(loc=5.0, size=800) * 50
+    y2 = np.random.normal(loc=5.0, size=800) * 10
+
+    x3 = np.random.normal(loc=55.0, size=200) * 10
+    y3 = np.random.normal(loc=4.0, size=200) * 10
+
+    x = np.concatenate((x1, x2, x3))
+    y = np.concatenate((y1, y2, y3))
+
+    TOOLS = "pan,wheel_zoom,box_select,lasso_select,reset"
+
+    # create the scatter plot
+    p = figure(
+        tools=TOOLS,
+        width=600,
+        height=600,
+        min_border=10,
+        min_border_left=50,
+        toolbar_location="above",
+        x_axis_location=None,
+        y_axis_location=None,
+        title="Linked Histograms",
+    )
+    p.background_fill_color = "#fafafa"
+    p.select(BoxSelectTool).select_every_mousemove = True
+
+    # p.select(LassoSelectTool).select_every_mousemove = False
+    #
+    r = p.scatter(x, y, size=3, color="#3A5785", alpha=0.6)
+    st.bokeh_chart(p)
+
+    # curdoc().add_root(layout)
+    curdoc().title = "Selection Histogram"
+    selected_points = []
+
+    def update(attr, old, new):
+        inds = new
+        if len(inds) == 0:
+            return
+        selected_points = inds
+        return new
+
+    r.data_source.selected.on_change("indices", update)
+
+    return r, selected_points
+
+
+def filter_and_preprocess_data(df):
     # Filter and preprocess data
     filt = (
         df[::10]
@@ -310,73 +467,65 @@ def main():
     )
     dfc = encode_cols(dfc)
 
-    data = convert_to_pytorch(dfc, device=device)
+    return dfc, df[::10]["status"]
+
+
+def main():
+    st.set_page_config(
+        page_title="Hello",
+        page_icon="👋",
+    )
+
+    st.write("# Welcome to Streamlit! 👋")
+
+    # Get data
+    df = get_data()
+    device = "mps"
+
+    # Encode columns
+    dfc, label = filter_and_preprocess_data(df)
+    label_unique = label.unique()
+    st.selectbox("Select a label", label_unique)
+    min_occurrence = st.slider(
+        "Minimum occurrence", min_value=2, max_value=100, value=10
+    )
+    eps = st.selectbox("Epsilon", [1e-2, 1e-3, 1e-4, 1e-5])
+
+    # data = convert_to_pytorch(dfc, device=device)
     # label = df['status'] == 'Cancelled'
     # model = train_model(data, label, encoding_size=3, num_layers=5, batch_size=2048,num_epochs=100,device=device)
     # coords = model.encoder(data).detach().cpu().numpy()
 
     # Calculate likelihoods
     likelihoods = calculate_likelihood(
-        dfc[::10], df[::10]["status"] == "Cancelled", eps=1e-2
+        dfc, label == "Cancelled", eps=eps, min_occurrence=min_occurrence
     )
 
     # Filter fields with high likelihood of cancellation
     filtered_fields = {k: v for k, v in likelihoods.items() if v > 5 or v < -5}
     sorted_fields = sorted(filtered_fields.items(), key=lambda x: x[1], reverse=True)
-    # st.write("Fields with high likelihood of cancellation:", sorted_fields)
-
-    # https://community.plotly.com/t/hover-display-values-on-multiple-figures/47590
-
-    # Extract labels and values from sorted fields
     labels = [x[0] for x in sorted_fields]
     values = [x[1] for x in sorted_fields]
+    # https://community.plotly.com/t/hover-display-values-on-multiple-figures/47590
 
     fig = px.bar(
         x=values,
         y=labels,
         orientation="h",
         title="Vertical Bar Plot of Sorted Fields",
-        labels={"x": "Values", "y": "Fields"},
+        labels={"x": "Likelihood %", "y": "Fields"},
     )
     st.plotly_chart(fig)
 
-    # # Create a vertical bar plot using Plotly
-    # fig = go.Figure(go.Bar(
-    #     x=values,
-    #     y=labels,
-    #     orientation='h',
-    #     hoverinfo='x',  # Display only x-values on hover
-    # ))
+    # fig_scatter, data, label = plot_2d_scatter(dfc, df['status'])
+    fig_scatter, data, label = plot_2d_scatter(dfc, df["status"])
 
-    # # Customize the layout
-    # fig.update_layout(
-    #     title='Vertical Bar Plot of Sorted Fields',
-    #     xaxis_title='Values',
-    #     yaxis_title='Fields',
-    #     yaxis={'categoryorder': 'total ascending'}
-    # )
+    # f = go.FigureWidget([go.Scatter(x=data[:,0],y=data[:,1], mode='markers')])
 
-    # # Display the Plotly figure in Streamlit
-    # fig_id = st.plotly_chart(fig).id
+    # fig_scatter.on_selection(selection_fn)
 
-    # Assuming encoded_data contains the encoded data (torch tensor)
-    # encoded_data should have shape (num_samples, 3)
-    lda = LinearDiscriminantAnalysis(n_components=3)
-
-    # Plot the 3D scatter plot
-    fig = plt.figure()
-    # ax = fig.add_subplot(111, projection='3d')
-    ind = np.random.choice(len(data), size=1000, replace=True)
-
-    coords = pd.get_dummies(dfc.iloc[ind])
-    pts = lda.fit_transform(coords, df["status"][ind])
-
-    # ax.scatter(*pts.T)
-    plt.scatter(pts[:, 2], pts[:, 1], c=df["status"][ind] == "Cancelled", alpha=0.3)
-
-    # Create Plotly figure
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=pts[:, 2], y=pts[:, 1], mode="markers", name="Data"))
+    # _, pts = bokeh_demo(data, label)
+    # st.write(pts)
 
 
 # Execute main function
