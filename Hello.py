@@ -14,6 +14,7 @@
 import gzip
 import json
 import math
+import multiprocessing
 import pickle
 import time
 from dataclasses import dataclass
@@ -151,35 +152,61 @@ def convert_to_pytorch(df, device="cpu"):
     return torch.from_numpy(pd.get_dummies(df.astype(str)).values).float().to(device)
 
 
+def likelihood_inner_loop(c, vc, dc, idx, ratio, eps, min_occurrence):
+    res = {}
+    if len(vc) < 2:
+        return res
+
+    for v in vc.index:
+        cur_idx = dc == v
+        if idx[cur_idx].sum() < min_occurrence:
+            continue
+
+        cur_ratio = idx[cur_idx].mean()
+
+        if (
+            np.isnan(cur_ratio)
+            or cur_ratio < eps
+            or cur_ratio > 1 - eps
+            # or cur_entropy < 1.1
+            # or cur_entropy > 3
+        ):
+            continue
+        likelihood = cur_ratio / ratio
+
+        # st.write(cur_ratio, cur_entropy, c, v)
+        res[f"{c}-{v}"] = (likelihood - 1) * 100
+    return res
+
+
+# @st.cache_data
 def calculate_likelihood(df, idx, eps=3e-2, min_occurrence=10):
     res = {}
     ratio = idx.mean()
+    # Create a multiprocessing Pool
+    pool = multiprocessing.Pool()
+
+    results = []
     for c in df.columns:
         dc = df[c]
         vc = dc.astype(str).value_counts()
-        if len(vc) < 2:
-            continue
 
-        cur_entropy = entropy(dc)
-        for v in vc.index:
-            cur_idx = dc == v
-            if cur_idx.sum() < min_occurrence:
-                continue
+        # Map the function to the list of arguments
+        results.append(
+            pool.apply_async(
+                likelihood_inner_loop, [*[c, vc, dc, idx, ratio, eps, min_occurrence]]
+            )
+        )
 
-            cur_ratio = idx[cur_idx].mean()
+    # Close the pool to release resources
+    pool.close()
+    pool.join()
 
-            if (
-                np.isnan(cur_ratio)
-                or cur_ratio < eps
-                or cur_ratio > 1 - eps
-                # or cur_entropy < 1.1
-                # or cur_entropy > 3
-            ):
-                continue
-            likelihood = cur_ratio / ratio
+    # Get results from asynchronous calls
+    for result in results:
+        if result.get() is not None:
+            res.update(result.get())
 
-            # st.write(cur_ratio, cur_entropy, c, v)
-            res[f"{c}-{v}"] = (likelihood - 1) * 100
     res = dict(sorted(res.items(), key=lambda x: x[1], reverse=True))
     return res
 
@@ -193,149 +220,6 @@ def calculate_coordinates(dfc):
 
     df_coords = pd.DataFrame(coords, columns=["x", "y"])
     return df_coords
-
-
-class AutoencoderWithClassifier(nn.Module):
-    def __init__(self, input_size, encoding_size, num_layers, exponent=3, device="cpu"):
-        super().__init__()
-        encoder_layers = []
-        decoder_layers = []
-
-        # Calculate the number of neurons in the first hidden layer
-        initial_neurons = input_size
-        for _ in range(num_layers):
-            next_neurons = int(
-                initial_neurons / exponent
-            )  # Halve the number of neurons
-            encoder_layers.append(
-                nn.Linear(initial_neurons, next_neurons, device=device)
-            )
-            encoder_layers.append(nn.GELU())  # Add GELU activation to encoder layers
-            decoder_layers.insert(
-                0, nn.Linear(next_neurons, initial_neurons, device=device)
-            )  # Insert layers in reverse order
-            decoder_layers.insert(0, nn.GELU())  # Add GELU activation to encoder layers
-            initial_neurons = next_neurons
-        encoder_layers.append(nn.Linear(initial_neurons, encoding_size, device=device))
-        encoder_layers.append(nn.GELU())  # Add GELU activation to encoder layers
-        decoder_layers.insert(
-            0, nn.Linear(encoding_size, initial_neurons, device=device)
-        )  # Insert layers in reverse order
-        decoder_layers.insert(0, nn.GELU())  # Add GELU activation to encoder layers
-
-        # Add encoder and decoder layers to sequential
-        self.encoder = nn.Sequential(*encoder_layers)
-        self.decoder = nn.Sequential(*decoder_layers)
-
-        # Classification head
-        self.classifier = nn.Linear(input_size, 2, device=device)
-
-    def forward(self, x):
-        x_encoded = self.encoder(x)
-        x_decoded = self.decoder(x_encoded)
-        x_class = self.classifier(x)
-        return x_decoded, x_class
-
-
-def train_model(
-    data, labels, encoding_size, num_layers, batch_size=32, num_epochs=10, device="cpu"
-):
-    # Assuming X is your sparse one-hot encoded data matrix (torch tensor)
-    # X should have shape (num_samples, num_features)
-
-    # Create a PyTorch Dataset
-    dataset = TensorDataset(
-        data.to(device), torch.from_numpy(labels.values).long().to(device)
-    )  # Assuming labels is a pandas Series
-
-    # Create a PyTorch DataLoader
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    # Define the model, criterion, and optimizer
-    model = AutoencoderWithClassifier(
-        data.shape[1], encoding_size, num_layers, exponent=3
-    )
-    model = model.to("mps")
-    criterion_autoencoder = nn.KLDivLoss()
-    # criterion_classifier = nn.CrossEntropyLoss()  # Assuming you have class labels as integers
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-
-    # Train the model
-    epoch_num = 0
-    for (
-        data,
-        labels,
-    ) in train_loader:  # Assuming train_loader contains batches of data and labels
-        optimizer.zero_grad()
-        # reconstructions, class_scores = model(data)
-        reconstructions = model(data)[0]
-
-        # Compute autoencoder loss
-        loss_autoencoder = criterion_autoencoder(reconstructions, data)
-
-        # # Compute classification loss
-        # loss_classifier = criterion_classifier(class_scores, labels)
-
-        # Total loss
-        # loss = loss_autoencoder + loss_classifier
-        loss = loss_autoencoder
-
-        # Backpropagation and optimization
-        loss.backward()
-        optimizer.step()
-
-        # Print average loss for the epoch
-        # print(f'Autoencoder Loss: {loss_autoencoder.item():.4f}, Classification Loss: {loss_classifier.item():.4f}')
-        print(f"Autoencoder Loss: {loss_autoencoder.item():.4f}")
-
-        epoch_num += 1
-        if epoch_num > num_epochs:
-            break
-
-    return model
-
-
-def selection_fn(trace, points, selector):
-    idx = points.point_inds
-    return idx
-
-
-@dataclass
-class Point:
-    lat: float
-    lon: float
-
-    @classmethod
-    def from_dict(cls, data: Dict) -> "Point":
-        if "lat" in data:
-            return cls(float(data["lat"]), float(data["lng"]))
-        elif "latitude" in data:
-            return cls(float(data["latitude"]), float(data["longitude"]))
-        else:
-            raise NotImplementedError(data.keys())
-
-    def is_close_to(self, other: "Point") -> bool:
-        close_lat = self.lat - 0.0001 <= other.lat <= self.lat + 0.0001
-        close_lon = self.lon - 0.0001 <= other.lon <= self.lon + 0.0001
-        return close_lat and close_lon
-
-
-@dataclass
-class Bounds:
-    south_west: Point
-    north_east: Point
-
-    def contains_point(self, point: Point) -> bool:
-        in_lon = self.south_west.lon <= point.lon <= self.north_east.lon
-        in_lat = self.south_west.lat <= point.lat <= self.north_east.lat
-
-        return in_lon and in_lat
-
-    @classmethod
-    def from_dict(cls, data: Dict) -> "Bounds":
-        return cls(
-            Point.from_dict(data["_southWest"]), Point.from_dict(data["_northEast"])
-        )
 
 
 # @selection_fn
@@ -445,14 +329,16 @@ def bokeh_demo(data, label):
     return r, selected_points
 
 
-def filter_and_preprocess_data(df):
+@st.cache_data
+def filter_and_preprocess_data(df, gap, label_field="Cancelled"):
     # Filter and preprocess data
     filt = (
-        df[::10]
+        df[::gap]
         .astype(str)
-        .apply(lambda x: (2 ** (entropy(x)) / len(df[::10])), axis=0)
+        .apply(lambda x: (2 ** (entropy(x)) / len(df[::gap])), axis=0)
     )
-    dfc = df.loc[:, filt < 0.1]
+    dfc = df.loc[::gap, filt < 0.1]
+    lbl = df[::gap]["status"] == label_field
     dfc = dfc.drop(
         [
             "first_name",
@@ -464,10 +350,11 @@ def filter_and_preprocess_data(df):
             "status",
         ],
         axis=1,
+        errors="ignore",
     )
     dfc = encode_cols(dfc)
 
-    return dfc, df[::10]["status"]
+    return dfc, lbl
 
 
 def main():
@@ -483,9 +370,11 @@ def main():
     device = "mps"
 
     # Encode columns
-    dfc, label = filter_and_preprocess_data(df)
-    label_unique = label.unique()
-    st.selectbox("Select a label", label_unique)
+    gap = st.selectbox("Select a gap", [1, 2, 5, 10, 20, 50, 100], index=3)
+    label_select_all = df["status"].unique()
+    label_field = st.selectbox("Select a label", label_select_all)
+    dfc, label = filter_and_preprocess_data(df, gap, label_field)
+
     min_occurrence = st.slider(
         "Minimum occurrence", min_value=2, max_value=100, value=10
     )
@@ -497,8 +386,10 @@ def main():
     # coords = model.encoder(data).detach().cpu().numpy()
 
     # Calculate likelihoods
+    st.write(len(dfc))
+
     likelihoods = calculate_likelihood(
-        dfc, label == "Cancelled", eps=eps, min_occurrence=min_occurrence
+        dfc, label, eps=eps, min_occurrence=min_occurrence
     )
 
     # Filter fields with high likelihood of cancellation
@@ -508,17 +399,18 @@ def main():
     values = [x[1] for x in sorted_fields]
     # https://community.plotly.com/t/hover-display-values-on-multiple-figures/47590
 
-    fig = px.bar(
-        x=values,
-        y=labels,
-        orientation="h",
-        title="Vertical Bar Plot of Sorted Fields",
-        labels={"x": "Likelihood %", "y": "Fields"},
-    )
-    st.plotly_chart(fig)
+    if len(labels) > 0:
+        fig = px.bar(
+            x=values,
+            y=labels,
+            orientation="h",
+            title="Vertical Bar Plot of Sorted Fields",
+            labels={"x": "Likelihood %", "y": "Fields"},
+        )
+        st.plotly_chart(fig)
 
     # fig_scatter, data, label = plot_2d_scatter(dfc, df['status'])
-    fig_scatter, data, label = plot_2d_scatter(dfc, df["status"])
+    # fig_scatter, data, label = plot_2d_scatter(dfc, df["status"])
 
     # f = go.FigureWidget([go.Scatter(x=data[:,0],y=data[:,1], mode='markers')])
 

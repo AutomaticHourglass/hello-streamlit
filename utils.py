@@ -124,3 +124,146 @@ def mouse_selection():
 
     # Inject JavaScript code into the Streamlit app
     st.markdown(js, unsafe_allow_html=True)
+
+
+class AutoencoderWithClassifier(nn.Module):
+    def __init__(self, input_size, encoding_size, num_layers, exponent=3, device="cpu"):
+        super().__init__()
+        encoder_layers = []
+        decoder_layers = []
+
+        # Calculate the number of neurons in the first hidden layer
+        initial_neurons = input_size
+        for _ in range(num_layers):
+            next_neurons = int(
+                initial_neurons / exponent
+            )  # Halve the number of neurons
+            encoder_layers.append(
+                nn.Linear(initial_neurons, next_neurons, device=device)
+            )
+            encoder_layers.append(nn.GELU())  # Add GELU activation to encoder layers
+            decoder_layers.insert(
+                0, nn.Linear(next_neurons, initial_neurons, device=device)
+            )  # Insert layers in reverse order
+            decoder_layers.insert(0, nn.GELU())  # Add GELU activation to encoder layers
+            initial_neurons = next_neurons
+        encoder_layers.append(nn.Linear(initial_neurons, encoding_size, device=device))
+        encoder_layers.append(nn.GELU())  # Add GELU activation to encoder layers
+        decoder_layers.insert(
+            0, nn.Linear(encoding_size, initial_neurons, device=device)
+        )  # Insert layers in reverse order
+        decoder_layers.insert(0, nn.GELU())  # Add GELU activation to encoder layers
+
+        # Add encoder and decoder layers to sequential
+        self.encoder = nn.Sequential(*encoder_layers)
+        self.decoder = nn.Sequential(*decoder_layers)
+
+        # Classification head
+        self.classifier = nn.Linear(input_size, 2, device=device)
+
+    def forward(self, x):
+        x_encoded = self.encoder(x)
+        x_decoded = self.decoder(x_encoded)
+        x_class = self.classifier(x)
+        return x_decoded, x_class
+
+
+def train_model(
+    data, labels, encoding_size, num_layers, batch_size=32, num_epochs=10, device="cpu"
+):
+    # Assuming X is your sparse one-hot encoded data matrix (torch tensor)
+    # X should have shape (num_samples, num_features)
+
+    # Create a PyTorch Dataset
+    dataset = TensorDataset(
+        data.to(device), torch.from_numpy(labels.values).long().to(device)
+    )  # Assuming labels is a pandas Series
+
+    # Create a PyTorch DataLoader
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # Define the model, criterion, and optimizer
+    model = AutoencoderWithClassifier(
+        data.shape[1], encoding_size, num_layers, exponent=3
+    )
+    model = model.to("mps")
+    criterion_autoencoder = nn.KLDivLoss()
+    # criterion_classifier = nn.CrossEntropyLoss()  # Assuming you have class labels as integers
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    # Train the model
+    epoch_num = 0
+    for (
+        data,
+        labels,
+    ) in train_loader:  # Assuming train_loader contains batches of data and labels
+        optimizer.zero_grad()
+        # reconstructions, class_scores = model(data)
+        reconstructions = model(data)[0]
+
+        # Compute autoencoder loss
+        loss_autoencoder = criterion_autoencoder(reconstructions, data)
+
+        # # Compute classification loss
+        # loss_classifier = criterion_classifier(class_scores, labels)
+
+        # Total loss
+        # loss = loss_autoencoder + loss_classifier
+        loss = loss_autoencoder
+
+        # Backpropagation and optimization
+        loss.backward()
+        optimizer.step()
+
+        # Print average loss for the epoch
+        # print(f'Autoencoder Loss: {loss_autoencoder.item():.4f}, Classification Loss: {loss_classifier.item():.4f}')
+        print(f"Autoencoder Loss: {loss_autoencoder.item():.4f}")
+
+        epoch_num += 1
+        if epoch_num > num_epochs:
+            break
+
+    return model
+
+
+def selection_fn(trace, points, selector):
+    idx = points.point_inds
+    return idx
+
+
+@dataclass
+class Point:
+    lat: float
+    lon: float
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "Point":
+        if "lat" in data:
+            return cls(float(data["lat"]), float(data["lng"]))
+        elif "latitude" in data:
+            return cls(float(data["latitude"]), float(data["longitude"]))
+        else:
+            raise NotImplementedError(data.keys())
+
+    def is_close_to(self, other: "Point") -> bool:
+        close_lat = self.lat - 0.0001 <= other.lat <= self.lat + 0.0001
+        close_lon = self.lon - 0.0001 <= other.lon <= self.lon + 0.0001
+        return close_lat and close_lon
+
+
+@dataclass
+class Bounds:
+    south_west: Point
+    north_east: Point
+
+    def contains_point(self, point: Point) -> bool:
+        in_lon = self.south_west.lon <= point.lon <= self.north_east.lon
+        in_lat = self.south_west.lat <= point.lat <= self.north_east.lat
+
+        return in_lon and in_lat
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "Bounds":
+        return cls(
+            Point.from_dict(data["_southWest"]), Point.from_dict(data["_northEast"])
+        )
