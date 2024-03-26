@@ -152,7 +152,8 @@ def convert_to_pytorch(df, device="cpu"):
     return torch.from_numpy(pd.get_dummies(df.astype(str)).values).float().to(device)
 
 
-def likelihood_inner_loop(c, vc, dc, idx, ratio, eps, min_occurrence):
+@st.cache_resource
+def likelihood_inner_loop(c, vc, dc, idx, ratio, min_occurrence):
     res = {}
     if len(vc) < 2:
         return res
@@ -163,15 +164,6 @@ def likelihood_inner_loop(c, vc, dc, idx, ratio, eps, min_occurrence):
             continue
 
         cur_ratio = idx[cur_idx].mean()
-
-        if (
-            np.isnan(cur_ratio)
-            or cur_ratio < eps
-            or cur_ratio > 1 - eps
-            # or cur_entropy < 1.1
-            # or cur_entropy > 3
-        ):
-            continue
         likelihood = cur_ratio / ratio
 
         # st.write(cur_ratio, cur_entropy, c, v)
@@ -179,12 +171,12 @@ def likelihood_inner_loop(c, vc, dc, idx, ratio, eps, min_occurrence):
     return res
 
 
-# @st.cache_data
-def calculate_likelihood(df, idx, eps=3e-2, min_occurrence=10):
+@st.cache_data
+def calculate_likelihood(df, idx, min_occurrence=10):
     res = {}
     ratio = idx.mean()
     # Create a multiprocessing Pool
-    pool = multiprocessing.Pool()
+    pool = multiprocessing.Pool(processes=8)
 
     results = []
     for c in df.columns:
@@ -194,7 +186,7 @@ def calculate_likelihood(df, idx, eps=3e-2, min_occurrence=10):
         # Map the function to the list of arguments
         results.append(
             pool.apply_async(
-                likelihood_inner_loop, [*[c, vc, dc, idx, ratio, eps, min_occurrence]]
+                likelihood_inner_loop, [*[c, vc, dc, idx, ratio, min_occurrence]]
             )
         )
 
@@ -265,72 +257,14 @@ def plot_2d_scatter(df, label):
     # # select_event
     # # selected_points = plotly_events(fig, click_event=True, hover_event=False, select_event=True)
     #
-    return fig, pts, label[ind]
+    return fig
+    # return fig, pts, label[ind]
     # return fig, selected_points
 
 
-def bokeh_demo(data, label):
-    # Writes a component similar to st.write()
-    # fig = px.scatter(x=data["dim0"], y=data['dim1'])
-    # st.plotly_chart(fig, height=400)
-    #
-    # # selected_points = plotly_events(fig, click_event=False, hover_event=False, select_event=True)
-    # selected_points = fig.data[0].selectedpoints
-    # print(selected_points)
-
-    # create three normal population samples with different parameters
-    x1 = np.random.normal(loc=5.0, size=400) * 100
-    y1 = np.random.normal(loc=10.0, size=400) * 10
-
-    x2 = np.random.normal(loc=5.0, size=800) * 50
-    y2 = np.random.normal(loc=5.0, size=800) * 10
-
-    x3 = np.random.normal(loc=55.0, size=200) * 10
-    y3 = np.random.normal(loc=4.0, size=200) * 10
-
-    x = np.concatenate((x1, x2, x3))
-    y = np.concatenate((y1, y2, y3))
-
-    TOOLS = "pan,wheel_zoom,box_select,lasso_select,reset"
-
-    # create the scatter plot
-    p = figure(
-        tools=TOOLS,
-        width=600,
-        height=600,
-        min_border=10,
-        min_border_left=50,
-        toolbar_location="above",
-        x_axis_location=None,
-        y_axis_location=None,
-        title="Linked Histograms",
-    )
-    p.background_fill_color = "#fafafa"
-    p.select(BoxSelectTool).select_every_mousemove = True
-
-    # p.select(LassoSelectTool).select_every_mousemove = False
-    #
-    r = p.scatter(x, y, size=3, color="#3A5785", alpha=0.6)
-    st.bokeh_chart(p)
-
-    # curdoc().add_root(layout)
-    curdoc().title = "Selection Histogram"
-    selected_points = []
-
-    def update(attr, old, new):
-        inds = new
-        if len(inds) == 0:
-            return
-        selected_points = inds
-        return new
-
-    r.data_source.selected.on_change("indices", update)
-
-    return r, selected_points
-
-
 @st.cache_data
-def filter_and_preprocess_data(df, gap, label_field="Cancelled"):
+def filter_and_preprocess_data(df, perc, label_field="Cancelled"):
+    gap = 100 // perc
     # Filter and preprocess data
     filt = (
         df[::gap]
@@ -370,15 +304,19 @@ def main():
     device = "mps"
 
     # Encode columns
-    gap = st.selectbox("Select a gap", [1, 2, 5, 10, 20, 50, 100], index=3)
+    perc = st.selectbox(
+        "Select sampling percentage", [1, 2, 5, 10, 20, 50, 100], index=3
+    )
     label_select_all = df["status"].unique()
     label_field = st.selectbox("Select a label", label_select_all)
-    dfc, label = filter_and_preprocess_data(df, gap, label_field)
+    dfc, label = filter_and_preprocess_data(df, perc, label_field)
 
     min_occurrence = st.slider(
         "Minimum occurrence", min_value=2, max_value=100, value=10
     )
-    eps = st.selectbox("Epsilon", [1e-2, 1e-3, 1e-4, 1e-5])
+    min_abs_likelihood = st.slider(
+        "Minimum absolute likelihood", min_value=1, max_value=100, value=5
+    )
 
     # data = convert_to_pytorch(dfc, device=device)
     # label = df['status'] == 'Cancelled'
@@ -389,11 +327,15 @@ def main():
     st.write(len(dfc))
 
     likelihoods = calculate_likelihood(
-        dfc, label, eps=eps, min_occurrence=min_occurrence
+        dfc.astype(str), label, min_occurrence=min_occurrence
     )
 
     # Filter fields with high likelihood of cancellation
-    filtered_fields = {k: v for k, v in likelihoods.items() if v > 5 or v < -5}
+    filtered_fields = {
+        k: v
+        for k, v in likelihoods.items()
+        if v > min_abs_likelihood or v < -min_abs_likelihood
+    }
     sorted_fields = sorted(filtered_fields.items(), key=lambda x: x[1], reverse=True)
     labels = [x[0] for x in sorted_fields]
     values = [x[1] for x in sorted_fields]
@@ -404,20 +346,10 @@ def main():
             x=values,
             y=labels,
             orientation="h",
-            title="Vertical Bar Plot of Sorted Fields",
+            title="Likelihood of event depending on each Field",
             labels={"x": "Likelihood %", "y": "Fields"},
         )
         st.plotly_chart(fig)
-
-    # fig_scatter, data, label = plot_2d_scatter(dfc, df['status'])
-    # fig_scatter, data, label = plot_2d_scatter(dfc, df["status"])
-
-    # f = go.FigureWidget([go.Scatter(x=data[:,0],y=data[:,1], mode='markers')])
-
-    # fig_scatter.on_selection(selection_fn)
-
-    # _, pts = bokeh_demo(data, label)
-    # st.write(pts)
 
 
 # Execute main function
